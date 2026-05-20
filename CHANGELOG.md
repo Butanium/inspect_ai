@@ -1,6 +1,7 @@
 ## Unreleased
 
 - [Agent Intervention](https://inspect.aisi.org.uk/intervention.html) which provides the ability observe a running agent, interrupt it, and redirect it with follow-up messages.
+- vLLM: Support pinning LoRA adapters to a HuggingFace revision via `vllm/base:org/repo@revision` syntax (revision can be a branch, tag, or commit SHA). The snapshot is downloaded at parse time and the resolved local path is passed to vLLM, since vLLM's own LoRA loader does not accept a `revision`.
 
 ## 0.3.224 (20 May 2026)
 
