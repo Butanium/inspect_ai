@@ -11,6 +11,7 @@ from __future__ import annotations
 import atexit
 import json
 import logging
+import os
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -58,6 +59,64 @@ class VLLMServer:
 _vllm_servers: dict[str, VLLMServer] = {}
 
 
+def _looks_like_hf_repo_with_revision(adapter_path: str) -> tuple[str, str] | None:
+    """Detect the ``org/repo@revision`` form used to pin an HF repo.
+
+    Recognizes a branch name, tag, or commit SHA after ``@``.
+    Returns ``(repo, revision)`` or ``None``. Conservative — POSIX paths
+    can legally contain ``@``, so we only treat the suffix as a revision
+    when the input cannot plausibly be a filesystem path:
+
+    - Doesn't start with an absolute / relative / home-rooted prefix.
+    - Doesn't already exist as a file or directory on disk (consistent
+      with how :func:`vllm.lora.utils.get_adapter_absolute_path` resolves
+      bare paths before falling back to HF).
+
+    Args:
+        adapter_path: The right-hand side of the ``base:adapter`` model spec.
+    """
+    if "@" not in adapter_path:
+        return None
+    # Reject anything that's clearly a filesystem path by prefix
+    if adapter_path.startswith(("/", "./", "../", "~", "~/")):
+        return None
+    if os.path.isabs(adapter_path):
+        return None
+    # A bare relative path like ``models/foo@bar`` is legal on disk; if
+    # something matching this literal string exists, prefer the file.
+    if os.path.exists(adapter_path):
+        return None
+    repo, _, revision = adapter_path.rpartition("@")
+    if not repo or not revision:
+        return None
+    return repo, revision
+
+
+def _resolve_hf_revision(repo: str, revision: str) -> str:
+    """Download a LoRA adapter snapshot at a specific HF revision.
+
+    Returns the local absolute path containing the snapshot.
+
+    vLLM does not accept ``revision`` for runtime LoRA loading: its
+    ``LoRARequest`` schema has no such field and ``get_adapter_absolute_path``
+    calls ``snapshot_download(repo_id=...)`` without a revision argument.
+    Pre-resolving here lets downstream layers treat the adapter as a local
+    path, which they already handle correctly.
+
+    Only the adapter payload is fetched (``adapter_config.json`` +
+    ``adapter_model.safetensors``); other files in the repo are skipped to
+    keep the download minimal.
+    """
+    from huggingface_hub import snapshot_download
+
+    local_dir = snapshot_download(
+        repo_id=repo,
+        revision=revision,
+        allow_patterns=["adapter_config.json", "adapter_model.safetensors"],
+    )
+    return os.path.abspath(local_dir)
+
+
 def parse_vllm_model(model_name: str) -> tuple[str, str | None, str | None]:
     """Parse vLLM model name into base model and optional LoRA adapter.
 
@@ -65,25 +124,52 @@ def parse_vllm_model(model_name: str) -> tuple[str, str | None, str | None]:
     Splits on the first colon only (the adapter path may itself contain
     colons, e.g. for URLs).
 
+    The adapter path can be:
+
+    - A local filesystem path (absolute, ``./relative``, or ``~``-expanded).
+    - A HuggingFace repo id like ``org/repo`` — vLLM will fetch it lazily.
+    - A HuggingFace repo id pinned to a revision via ``org/repo@revision``
+      (where revision is a branch name, tag, or commit SHA). The snapshot
+      is downloaded here and the resolved local path is passed downstream,
+      since vLLM's own LoRA loader does not accept a revision.
+
     Args:
         model_name: Model name, optionally with ``:adapter`` suffix.
 
     Returns:
         Tuple of (base_model, adapter_path, adapter_name) where
-        adapter_path is the HuggingFace repo or local path (``None``
-        if no adapter) and adapter_name is a ``/``-sanitized identifier
-        for the vLLM API (``None`` if no adapter).
+        adapter_path is the HuggingFace repo, local path, or resolved
+        snapshot path (``None`` if no adapter) and adapter_name is a
+        ``/``-sanitized identifier for the vLLM API (``None`` if no
+        adapter). When a revision was specified, the identifier is derived
+        from ``repo@revision`` rather than the opaque snapshot path, so it
+        stays stable across machines.
 
     Examples:
         >>> parse_vllm_model("meta-llama/Llama-3-8B")
         ('meta-llama/Llama-3-8B', None, None)
         >>> parse_vllm_model("meta-llama/Llama-3-8B:org/my-adapter")
         ('meta-llama/Llama-3-8B', 'org/my-adapter', 'org_my-adapter')
+        >>> # With a revision (snapshot downloaded; path varies by cache):
+        >>> # parse_vllm_model("meta-llama/Llama-3-8B:org/my-adapter@v2")
+        >>> # -> ('meta-llama/Llama-3-8B', '/cache/.../snapshots/<sha>',
+        >>> #     'org_my-adapter_v2')
     """
     if ":" not in model_name:
         return (model_name, None, None)
     # Split on first colon only (adapter path may contain colons for URLs)
     base, adapter_path = model_name.split(":", 1)
+
+    rev_info = _looks_like_hf_repo_with_revision(adapter_path)
+    if rev_info is not None:
+        repo, revision = rev_info
+        adapter_path = _resolve_hf_revision(repo, revision)
+        # Key the vLLM-side adapter id on repo+revision rather than the
+        # local snapshot path, which is opaque (cache-dependent) and would
+        # change across machines / cache resets.
+        adapter_name = f"{repo}_{revision}".replace("/", "_")
+        return (base, adapter_path, adapter_name)
+
     # Replace / with _ to create a flat vLLM adapter identifier
     adapter_name = adapter_path.replace("/", "_")
     return (base, adapter_path, adapter_name)

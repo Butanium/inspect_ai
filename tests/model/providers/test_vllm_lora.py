@@ -9,6 +9,7 @@ from inspect_ai.dataset import Sample
 from inspect_ai.model import ChatMessageUser, GenerateConfig, get_model
 from inspect_ai.model._providers._vllm_lora import (
     VLLMServer,
+    _looks_like_hf_repo_with_revision,
     _normalize_api_base,
     _vllm_servers,
     cleanup_servers,
@@ -81,6 +82,133 @@ class TestParseVLLMModel:
         assert base == "org/model"
         assert adapter_path == "other-org/sub/adapter"
         assert adapter_name == "other-org_sub_adapter"
+
+    def test_with_hf_revision_branch(self) -> None:
+        """`repo@branch` triggers a snapshot_download and returns the local path."""
+        fake_local = "/tmp/hf-cache/models--myorg--my-lora/snapshots/abc123"
+        with patch(
+            "huggingface_hub.snapshot_download",
+            return_value=fake_local,
+        ) as mock_dl:
+            base, adapter_path, adapter_name = parse_vllm_model(
+                "meta-llama/Llama-3-8B:myorg/my-lora@ckpt000010"
+            )
+
+        mock_dl.assert_called_once_with(
+            repo_id="myorg/my-lora",
+            revision="ckpt000010",
+            allow_patterns=["adapter_config.json", "adapter_model.safetensors"],
+        )
+        assert base == "meta-llama/Llama-3-8B"
+        assert adapter_path == fake_local
+        # Identifier is stable across machines: keyed on repo+revision, not cache path
+        assert adapter_name == "myorg_my-lora_ckpt000010"
+
+    def test_with_hf_revision_commit_sha(self) -> None:
+        """Commit-SHA revisions work the same as branch names."""
+        fake_local = "/tmp/hf-cache/snapshot-sha"
+        with patch(
+            "huggingface_hub.snapshot_download",
+            return_value=fake_local,
+        ) as mock_dl:
+            base, adapter_path, adapter_name = parse_vllm_model(
+                "base:org/repo@deadbeef1234"
+            )
+
+        mock_dl.assert_called_once()
+        assert adapter_path == fake_local
+        assert adapter_name == "org_repo_deadbeef1234"
+
+    def test_absolute_path_with_at_not_treated_as_revision(self) -> None:
+        """A literal `@` inside an absolute filesystem path is not a revision."""
+        with patch("huggingface_hub.snapshot_download") as mock_dl:
+            base, adapter_path, adapter_name = parse_vllm_model(
+                "llama:/var/cache/adapter@scratch"
+            )
+        mock_dl.assert_not_called()
+        assert adapter_path == "/var/cache/adapter@scratch"
+
+    def test_relative_path_with_at_not_treated_as_revision(self) -> None:
+        """A literal `@` inside a `./relative` path is not a revision."""
+        with patch("huggingface_hub.snapshot_download") as mock_dl:
+            base, adapter_path, adapter_name = parse_vllm_model(
+                "llama:./local/adapter@scratch"
+            )
+        mock_dl.assert_not_called()
+        assert adapter_path == "./local/adapter@scratch"
+
+    def test_home_path_with_at_not_treated_as_revision(self) -> None:
+        """A literal `@` inside a `~`-rooted path is not a revision."""
+        with patch("huggingface_hub.snapshot_download") as mock_dl:
+            base, adapter_path, adapter_name = parse_vllm_model(
+                "llama:~/adapters/foo@scratch"
+            )
+        mock_dl.assert_not_called()
+        assert adapter_path == "~/adapters/foo@scratch"
+
+
+# =============================================================================
+# _looks_like_hf_repo_with_revision
+# =============================================================================
+
+
+class TestLooksLikeHfRepoWithRevision:
+    def test_simple_repo_with_branch(self) -> None:
+        assert _looks_like_hf_repo_with_revision("org/repo@main") == (
+            "org/repo",
+            "main",
+        )
+
+    def test_no_at_returns_none(self) -> None:
+        assert _looks_like_hf_repo_with_revision("org/repo") is None
+
+    def test_absolute_path_returns_none(self) -> None:
+        assert _looks_like_hf_repo_with_revision("/tmp/adapter@x") is None
+
+    def test_relative_dot_path_returns_none(self) -> None:
+        assert _looks_like_hf_repo_with_revision("./a@b") is None
+
+    def test_relative_dotdot_path_returns_none(self) -> None:
+        assert _looks_like_hf_repo_with_revision("../a@b") is None
+
+    def test_home_path_returns_none(self) -> None:
+        assert _looks_like_hf_repo_with_revision("~/a@b") is None
+
+    def test_multiple_at_takes_last(self) -> None:
+        # `@` is rare in branch names but allowed; the rightmost `@` separates.
+        assert _looks_like_hf_repo_with_revision("org/repo@v2@beta") == (
+            "org/repo@v2",
+            "beta",
+        )
+
+    def test_trailing_at_returns_none(self) -> None:
+        assert _looks_like_hf_repo_with_revision("org/repo@") is None
+
+    def test_leading_at_returns_none(self) -> None:
+        assert _looks_like_hf_repo_with_revision("@main") is None
+
+    def test_bare_relative_path_that_exists_returns_none(self, tmp_path) -> None:
+        """A bare relative path containing ``@`` that exists on disk wins."""
+        # Create models/foo@bar/ inside the per-test tmp dir
+        adapter_dir = tmp_path / "models" / "foo@bar"
+        adapter_dir.mkdir(parents=True)
+        # Resolve relative to tmp_path so the check exercises os.path.exists
+        import os as _os
+
+        old_cwd = _os.getcwd()
+        try:
+            _os.chdir(tmp_path)
+            assert _looks_like_hf_repo_with_revision("models/foo@bar") is None
+        finally:
+            _os.chdir(old_cwd)
+
+    def test_bare_relative_path_that_does_not_exist_parses(self) -> None:
+        """A bare ``org/repo@rev`` that doesn't exist on disk is treated as HF."""
+        # nonexistent_org/nonexistent_repo@v1 should not exist in CWD
+        result = _looks_like_hf_repo_with_revision(
+            "nonexistent_org/nonexistent_repo@v1"
+        )
+        assert result == ("nonexistent_org/nonexistent_repo", "v1")
 
 
 # =============================================================================
